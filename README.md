@@ -25,7 +25,7 @@
 - Python 3.9+
 - Access to a Wazuh SIEM / OpenSearch instance (port `9200`)
 - VK Teams Bot API Token
-- AI / RouterAI API Key
+- AI API Key
 
 ### 2. Installation
 
@@ -41,22 +41,22 @@ cd wazuh-vkteams-ai-bot
 Copy the example configuration file and set your credentials:
 
 ```bash
-cp config/access_tokens.py.example config/access_tokens.py
+cp access_tokens.py.example access_tokens.py
 ```
 
-Edit `config/access_tokens.py`:
+Edit `access_tokens.py`:
 
 ```python
-VK_TEAMS_TOKEN = "your_vk_teams_bot_token"
-VK_TEAMS_API_URL = "[https://myteam.mail.ru/bot/v1](https://myteam.mail.ru/bot/v1)"
+VK_TEAMS_TOKEN = "your_vk_teams_bot_token"                # substitute for actual one
+VK_TEAMS_API_URL = "https://myteam.mail.ru/bot/v1](https://myteam.mail.ru/bot/v1"
 
-WAZUH_HOST = "http://localhost:9200"
-WAZUH_USER = "admin"
-WAZUH_PASS = "your_wazuh_password"
+WAZUH_HOST = "http://localhost:9200"                      # substitute for actual one
+WAZUH_USER = "admin"                                      # substitute for actual one
+WAZUH_PASS = "your_wazuh_password"                        # substitute for actual one
 
 AI_KEY = "your_ai_api_key"
 AI_URL = "https://example-ai.com/api/v1/chat/completions" # substitute for actual one
-AI_MODEL = "qwen/qwen3.7-plus" # substitute for actual one
+AI_MODEL = "qwen/qwen3.7-plus"                            # substitute for actual one
 ```
 
 ### 4. Running the Bot
@@ -64,7 +64,7 @@ AI_MODEL = "qwen/qwen3.7-plus" # substitute for actual one
 Start the service using Python:
 
 ```bash
-python3 wazuh_vkteams_bot.main
+python3 wazuh_vkteams_ai_bot.py
 ```
 
 ---
