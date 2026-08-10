@@ -32,9 +32,8 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone [https://github.com/your-org/wazuh-vkteams-ai-bot.git](https://github.com/your-org/wazuh-vkteams-ai-bot.git)
+git clone https://github.com/bret99/wazuh-vkteams-ai-bot.git
 cd wazuh-vkteams-ai-bot
-pip install -r requirements.txt
 ```
 
 ### 3. Configuration
@@ -55,9 +54,9 @@ WAZUH_HOST = "http://localhost:9200"
 WAZUH_USER = "admin"
 WAZUH_PASS = "your_wazuh_password"
 
-AI_KEY = "sk-your_ai_api_key"
-AI_URL = "[https://routerai.ru/api/v1/chat/completions](https://routerai.ru/api/v1/chat/completions)"
-AI_MODEL = "qwen/qwen3.7-plus"
+AI_KEY = "your_ai_api_key"
+AI_URL = "https://example-ai.com/api/v1/chat/completions" # substitute for actual one
+AI_MODEL = "qwen/qwen3.7-plus" # substitute for actual one
 ```
 
 ### 4. Running the Bot
@@ -65,7 +64,7 @@ AI_MODEL = "qwen/qwen3.7-plus"
 Start the service using Python:
 
 ```bash
-python -m src.wazuh_vkteams_bot.main
+python3 wazuh_vkteams_bot.main
 ```
 
 ---
