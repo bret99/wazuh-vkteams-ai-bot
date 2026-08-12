@@ -7,6 +7,8 @@ VK Teams [Workspace] SIEM Bot — Single-Node OpenSearch Aggregator & AI Analyze
 
 import json
 import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib3
@@ -16,25 +18,14 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from opensearchpy import OpenSearch
 
-from access_tokens import (
-    VK_TEAMS_TOKEN,
-    VK_TEAMS_API_URL,
-    WAZUH_HOST,
-    WAZUH_USER,
-    WAZUH_PASS,
-    AI_KEY,
-    AI_URL,
-    AI_MODEL,
-    TARGET_USER_FIELDS,
-    EXCLUDED_RULE_GROUPS,
-)
-
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================================================================
-# CONFIGURATION & GLOBAL VARIABLES
+# CONFIGURATION
 # =============================================================================
+from access_tokens import VK_TEAMS_TOKEN, VK_TEAMS_API_URL, AI_KEY, AI_URL, AI_MODEL, TARGET_USER_FIELDS, EXCLUDED_RULE_GROUPS, WAZUH_HOST, WAZUH_USER, WAZUH_PASS
+
 ALLOWED_USERS = []
 
 PERIOD_DELTAS = {
@@ -45,16 +36,65 @@ PERIOD_DELTAS = {
     "30d": (timedelta(days=30), "30 days")
 }
 
+# Default Prompt Templates
+DEFAULT_USER_PROMPT_TEMPLATE = (
+    "Проанализируй JSON-отчет событий безопасности как продвинутый SOC-аналитик. "
+    "Ограничь свой ответ максимум в 1000 токенов/символов.\n\n"
+    "Сформируй отчет строго в следующей структуре:\n\n"
+    "🛡️ SOC ML: USER {target_val} Report\n\n"
+    "📊 Events: {events_count}\n\n"
+    "**Аналитический отчет SOC (Security Operations Center)**\n"
+    "**Дата анализа:** {date_str}\n"
+    "**Объект мониторинга:** Wazuh SIEM Node\n"
+    "**Пользователь:** {target_val}\n"
+    "**Временной диапазон:** {period_label}\n"
+    "**Система защиты:** Wazuh OSSEC / KESL\n\n"
+    "---\n"
+    "📊 Краткое резюме (Executive Summary)\n"
+    "[Краткие выводы: критичность, наличие IoC, уровень шума]\n\n"
+    "---\n"
+    "🔍 Детальный разбор ключевых событий\n"
+    "1. [Категория события] -> Анализ -> Вердикт (False Positive / Шум / Требует проверки / Инцидент)\n\n"
+    "---\n"
+    "🛡️ Рекомендации для команды ИБ и IT\n"
+    "1. [Конкретная рекомендация]\n\n"
+    "**Статус отчета:** [Закрыт (False Positive / Noise) / Требует расследования]"
+)
+
+DEFAULT_HOST_PROMPT_TEMPLATE = (
+    "Проанализируй JSON-отчет событий безопасности как продвинутый SOC-аналитик. "
+    "Ограничь свой ответ максимум в 1000 токенов/символов.\n\n"
+    "Сформируй отчет строго в следующей структуре:\n\n"
+    "🛡️ SOC ML: HOST {target_val} Report\n\n"
+    "📊 Events: {events_count}\n\n"
+    "**Аналитический отчет SOC (Security Operations Center)**\n"
+    "**Дата анализа:** {date_str}\n"
+    "**Объект мониторинга:** Wazuh SIEM Node\n"
+    "**Хост/Агент:** {target_val}\n"
+    "**Временной диапазон:** {period_label}\n"
+    "**Система защиты:** Wazuh OSSEC / KESL\n\n"
+    "---\n"
+    "📊 Краткое резюме (Executive Summary)\n"
+    "[Краткие выводы: критичность, наличие IoC, уровень шума]\n\n"
+    "---\n"
+    "🔍 Детальный разбор ключевых событий\n"
+    "1. [Категория события] -> Анализ -> Вердикт (False Positive / Шум / Требует проверки / Инцидент)\n\n"
+    "---\n"
+    "🛡️ Рекомендации для команды ИБ и IT\n"
+    "1. [Конкретная рекомендация]\n\n"
+    "**Статус отчета:** [Закрыт (False Positive / Noise) / Требует расследования]"
+)
+
 # Global FSM storage and worker pool
 USER_STATES = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
 
 # =============================================================================
-# DATA FETCHING & PROCESSING
+# DATA FETCHING & AGGREGATION
 # =============================================================================
 def build_search_clauses(target_val: str, search_type: str) -> tuple:
-    """Build OpenSearch should and must_not clauses based on search type and excluded groups."""
+    """Build OpenSearch should and must_not clauses with case-insensitive exclusions."""
     fields = ["agent.name"] if search_type == "host" else TARGET_USER_FIELDS
     should_clauses = []
     for field in fields:
@@ -64,21 +104,17 @@ def build_search_clauses(target_val: str, search_type: str) -> tuple:
 
     must_not_clauses = []
     if EXCLUDED_RULE_GROUPS:
-        must_not_clauses.append({"terms": {"rule.groups": EXCLUDED_RULE_GROUPS}})
-        must_not_clauses.append({"terms": {"rule.groups.keyword": EXCLUDED_RULE_GROUPS}})
+        normalized_exclusions = [g.lower() for g in EXCLUDED_RULE_GROUPS]
+        must_not_clauses.append({"terms": {"rule.groups": normalized_exclusions}})
+        must_not_clauses.append({"terms": {"rule.groups.keyword": normalized_exclusions}})
 
     return should_clauses, must_not_clauses
 
 
-def fetch_wazuh_events(target_val: str, search_type: str, delta: timedelta) -> list:
-    """Fetch events locally from single Wazuh Node via OpenSearch client."""
-    end_date = datetime.now()
-    start_date = end_date - delta
-    start_iso = start_date.isoformat()
-    end_iso = end_date.isoformat()
-
+def fetch_wazuh_events(target_val: str, search_type: str, start_iso: str, end_iso: str) -> list:
+    """Fetch events locally from Wazuh Node via OpenSearch client."""
     client = OpenSearch(
-        hosts=[WAZUH_HOST],
+        hosts=WAZUH_HOST,
         http_auth=(WAZUH_USER, WAZUH_PASS),
         use_ssl=True,
         verify_certs=False,
@@ -128,60 +164,29 @@ def fetch_wazuh_events(target_val: str, search_type: str, delta: timedelta) -> l
         return []
 
 
-def process_report_python(raw_events: list) -> list:
-    """Filter unnecessary fields from events list directly in Python."""
-    cleaned_events = []
-    for event in raw_events:
-        evt = json.loads(json.dumps(event))
-        
-        # Strip root level fields
-        for field in ["decoder", "input", "manager", "full_log", "full.log", "location", "id"]:
-            evt.pop(field, None)
-            
-        # Strip agent nested fields
-        if isinstance(evt.get("agent"), dict):
-            evt["agent"].pop("ip", None)
-            evt["agent"].pop("id", None)
-            
-        # Strip rule nested fields
-        if isinstance(evt.get("rule"), dict):
-            evt["rule"].pop("level", None)
-            evt["rule"].pop("id", None)
-            evt["rule"].pop("mail", None)
-            
-        cleaned_events.append(evt)
-    return cleaned_events
-
-
-def query_ai(json_data: list, target_val: str, search_type: str, period_label: str) -> str:
-    """Send aggregated report to AI API with token limit constraint."""
-    entity_header = "USER" if search_type == "user" else "HOST"
-    entity_label = "Пользователь" if search_type == "user" else "Хост/Агент"
-
-    prompt = (
-        f"Проанализируй JSON-отчет событий безопасности как продвинутый SOC-аналитик. "
-        f"Ограничь свой ответ максимум в 1000 токенов/символов.\n\n"
-        f"Сформируй отчет строго в следующей структуре:\n\n"
-        f"🛡️ SOC ML: {entity_header} {target_val} Report\n\n"
-        f"📊 Events: {len(json_data)}\n\n"
-        f"**Аналитический отчет SOC (Security Operations Center)**\n"
-        f"**Дата анализа:** {datetime.now().strftime('%Y-%m-%d')}\n"
-        f"**Объект мониторинга:** Wazuh SIEM Node\n"
-        f"**{entity_label}:** {target_val}\n"
-        f"**Временной диапазон:** {period_label}\n"
-        f"**Система защиты:** Wazuh OSSEC / KESL\n\n"
-        f"---\n"
-        f"📊 Краткое резюме (Executive Summary)\n"
-        f"[Краткие выводы: критичность, наличие IoC, уровень шума]\n\n"
-        f"---\n"
-        f"🔍 Детальный разбор ключевых событий\n"
-        f"1. [Категория события] -> Анализ -> Вердикт (False Positive / Шум / Требует проверки / Инцидент)\n\n"
-        f"---\n"
-        f"🛡️ Рекомендации для команды ИБ и IT\n"
-        f"1. [Конкретная рекомендация]\n\n"
-        f"**Статус отчета:** [Закрыт (False Positive / Noise) / Требует расследования]\n\n"
-        f"JSON данных:\n" + json.dumps(json_data, ensure_ascii=False)
+def process_report_jq(raw_path: str, final_path: str) -> bool:
+    """Strip unnecessary fields from raw report using jq utility."""
+    jq_cmd = (
+        f"jq 'map(del(.agent.ip, .agent.id, .decoder, .input, .manager, "
+        f".full_log, .full.log, .location, .id, .rule.level, .rule.id, .rule.mail))' "
+        f"{shlex.quote(raw_path)} > {shlex.quote(final_path)}"
     )
+    res = subprocess.run(jq_cmd, shell=True, capture_output=True, text=True)
+    return res.returncode == 0 and os.path.exists(final_path)
+
+
+def query_router_ai(json_data: list, target_val: str, search_type: str, period_label: str, custom_prompt: str = None) -> str:
+    """Send aggregated report to RouterAI API using default or custom prompt."""
+    if custom_prompt:
+        prompt = f"{custom_prompt}\n\nJSON данных:\n" + json.dumps(json_data, ensure_ascii=False)
+    else:
+        template = DEFAULT_USER_PROMPT_TEMPLATE if search_type == "user" else DEFAULT_HOST_PROMPT_TEMPLATE
+        prompt = template.format(
+            target_val=target_val,
+            events_count=len(json_data),
+            date_str=datetime.now().strftime("%Y-%m-%d"),
+            period_label=period_label
+        ) + "\n\nJSON данных:\n" + json.dumps(json_data, ensure_ascii=False)
 
     payload = {
         "model": AI_MODEL,
@@ -199,9 +204,9 @@ def query_ai(json_data: list, target_val: str, search_type: str, period_label: s
         if response.status_code == 200:
             result = response.json()
             return result["choices"][0]["message"]["content"]
-        return f"❌ AI API Error [{response.status_code}]: {response.text}"
+        return f"❌ RouterAI API Error [{response.status_code}]: {response.text}"
     except Exception as e:
-        return f"❌ Failed to reach AI API: {e}"
+        return f"❌ Failed to reach RouterAI API: {e}"
 
 
 def cleanup_all_reports(target_val: str = None, search_type: str = "user"):
@@ -293,6 +298,17 @@ def kb_main():
     ]
 
 
+def kb_prompt_options(search_type: str):
+    return [
+        [
+            {"text": "👀 See default prompt", "callbackData": f"prompt_see:{search_type}", "style": "primary"},
+            {"text": "▶️ Run default prompt", "callbackData": f"prompt_run:{search_type}", "style": "primary"}
+        ],
+        [{"text": "✍️ Enter your prompt", "callbackData": f"prompt_custom:{search_type}", "style": "primary"}],
+        [{"text": "❌ Cancel", "callbackData": "menu:main", "style": "attention"}]
+    ]
+
+
 def kb_periods():
     return [
         [
@@ -328,7 +344,7 @@ def _check_access(user_id: str, chat_id: str, bot: VKTeamsBot) -> bool:
 
 
 def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, period_key: str):
-    """Collect events from Wazuh node, apply Python filter, and present decision menu."""
+    """Collect events from Wazuh node, apply jq filter, and present decision menu."""
     state = USER_STATES.get(user_id, {})
     target_val = state.get("target_val")
     search_type = state.get("search_type", "user")
@@ -337,7 +353,12 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
     entity_label = "user" if search_type == "user" else "host"
     bot.send_text(chat_id, f"⏳ Collecting events for {entity_label} `{target_val}` from Wazuh ({period_label})...")
 
-    events = fetch_wazuh_events(target_val, search_type, delta)
+    end_date = datetime.now()
+    start_date = end_date - delta
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
+
+    events = fetch_wazuh_events(target_val, search_type, start_iso, end_iso)
 
     if not events:
         bot.send_text(
@@ -352,13 +373,14 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
     final_file = "/tmp/final_report.json"
 
     try:
-        cleaned_events = process_report_python(events)
-
         with open(raw_file, "w", encoding="utf-8") as f:
             json.dump(events, f, ensure_ascii=False, indent=2)
 
-        with open(final_file, "w", encoding="utf-8") as f:
-            json.dump(cleaned_events, f, ensure_ascii=False, indent=2)
+        if not process_report_jq(raw_file, final_file):
+            bot.send_text(chat_id, "❌ Failed to process report with jq utility.", kb_main())
+            cleanup_all_reports(target_val, search_type)
+            USER_STATES.pop(user_id, None)
+            return
 
         size_bytes = os.path.getsize(final_file)
         size_kb = size_bytes / 1024.0
@@ -368,7 +390,7 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
 
         bot.send_text(
             chat_id,
-            f"✅ Report generated from SIEM.\n📁 File size: `{size_kb:.2f} KB` (`{size_bytes}` bytes)\n\n"
+            f"✅ Report generated from SIEM node.\n📁 File size: `{size_kb:.2f} KB` (`{size_bytes}` bytes)\n\n"
             f"Do you want to send this report to AI for analysis?",
             kb_ai_decision()
         )
@@ -378,8 +400,8 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
         USER_STATES.pop(user_id, None)
 
 
-def async_send_to_ai(bot: VKTeamsBot, chat_id: str, user_id: str):
-    """Send processed final report to AI and return intelligence report."""
+def async_send_to_ai(bot: VKTeamsBot, chat_id: str, user_id: str, custom_prompt: str = None):
+    """Send processed final report to RouterAI and return intelligence report."""
     state = USER_STATES.get(user_id, {})
     target_val = state.get("target_val")
     search_type = state.get("search_type", "user")
@@ -392,7 +414,13 @@ def async_send_to_ai(bot: VKTeamsBot, chat_id: str, user_id: str):
         with open(final_file, "r", encoding="utf-8") as f:
             json_data = json.load(f)
 
-        ai_response = query_ai(json_data, target_val, search_type, period_label)
+        ai_response = query_router_ai(
+            json_data=json_data,
+            target_val=target_val,
+            search_type=search_type,
+            period_label=period_label,
+            custom_prompt=custom_prompt
+        )
         bot.send_text(chat_id, ai_response, kb_main())
     except Exception as e:
         bot.send_text(chat_id, f"❌ Error during AI analysis: {e}", kb_main())
@@ -411,6 +439,7 @@ def on_new_message(bot: VKTeamsBot, payload: dict):
     if not chat_id or not _check_access(user_id, chat_id, bot):
         return
 
+    # Handle explicit start/reset command
     if text.lower() in ("/start", "/reset", "start", "reset", "/help"):
         state = USER_STATES.pop(user_id, None)
         if state and state.get("target_val"):
@@ -425,24 +454,35 @@ def on_new_message(bot: VKTeamsBot, payload: dict):
         return
 
     state = USER_STATES.get(user_id)
-    if state and state.get("step") in ("awaiting_username", "awaiting_hostname"):
-        if not text:
-            label = "Username" if state.get("step") == "awaiting_username" else "Hostname"
-            bot.send_text(chat_id, f"⚠️ {label} cannot be empty. Enter target {label.lower()}:")
+    if state:
+        step = state.get("step")
+
+        if step in ("awaiting_username", "awaiting_hostname"):
+            if not text:
+                label = "Username" if step == "awaiting_username" else "Hostname"
+                bot.send_text(chat_id, f"⚠️ {label} cannot be empty. Enter target {label.lower()}:")
+                return
+
+            search_type = state.get("search_type", "user")
+            USER_STATES[user_id]["target_val"] = text
+            USER_STATES[user_id]["step"] = "awaiting_period"
+
+            label_name = "user" if search_type == "user" else "host"
+            bot.send_text(
+                chat_id,
+                f"🎯 Target {label_name}: `{text}`\n⚙️ Select event collection period:",
+                kb_periods()
+            )
             return
 
-        search_type = "user" if state.get("step") == "awaiting_username" else "host"
-        USER_STATES[user_id]["target_val"] = text
-        USER_STATES[user_id]["search_type"] = search_type
-        USER_STATES[user_id]["step"] = "awaiting_period"
+        elif step == "awaiting_custom_prompt":
+            if not text:
+                bot.send_text(chat_id, "⚠️ Prompt text cannot be empty. Enter your custom prompt:")
+                return
 
-        label_name = "user" if search_type == "user" else "host"
-        bot.send_text(
-            chat_id,
-            f"🎯 Target {label_name}: `{text}`\n⚙️ Select event collection period:",
-            kb_periods()
-        )
-        return
+            USER_STATES[user_id]["step"] = "sending_ai"
+            EXECUTOR.submit(async_send_to_ai, bot, chat_id, user_id, custom_prompt=text)
+            return
 
     bot.send_text(
         chat_id,
@@ -475,13 +515,44 @@ def on_callback(bot: VKTeamsBot, payload: dict):
             cleanup_all_reports(state["target_val"], state.get("search_type", "user"))
         bot.send_text(chat_id, "🤖 Main Menu:\nSelect activity type:", kb_main())
 
-    elif callback_data == "act:host_activity":
-        USER_STATES[user_id] = {"step": "awaiting_hostname"}
-        bot.send_text(chat_id, "💻 Enter target hostname for SIEM analysis (agent.name):")
-
     elif callback_data == "act:user_activity":
-        USER_STATES[user_id] = {"step": "awaiting_username"}
-        bot.send_text(chat_id, "✏️ Enter target username for SIEM analysis:")
+        USER_STATES[user_id] = {"search_type": "user"}
+        bot.send_text(chat_id, "👤 User Activity Options:", kb_prompt_options("user"))
+
+    elif callback_data == "act:host_activity":
+        USER_STATES[user_id] = {"search_type": "host"}
+        bot.send_text(chat_id, "💻 Host Activity Options:", kb_prompt_options("host"))
+
+    elif callback_data.startswith("prompt_see:"):
+        search_type = callback_data.split(":")[1]
+        template = DEFAULT_USER_PROMPT_TEMPLATE if search_type == "user" else DEFAULT_HOST_PROMPT_TEMPLATE
+        bot.send_text(
+            chat_id,
+            f"📄 **Default Prompt Template ({search_type.upper()}):**\n\n```\n{template}\n```",
+            kb_prompt_options(search_type)
+        )
+
+    elif callback_data.startswith("prompt_run:"):
+        search_type = callback_data.split(":")[1]
+        step = "awaiting_username" if search_type == "user" else "awaiting_hostname"
+        USER_STATES[user_id] = {
+            "search_type": search_type,
+            "prompt_mode": "default",
+            "step": step
+        }
+        prompt_msg = "✏️ Enter target username for SIEM analysis:" if search_type == "user" else "💻 Enter target hostname for SIEM analysis (agent.name):"
+        bot.send_text(chat_id, prompt_msg)
+
+    elif callback_data.startswith("prompt_custom:"):
+        search_type = callback_data.split(":")[1]
+        step = "awaiting_username" if search_type == "user" else "awaiting_hostname"
+        USER_STATES[user_id] = {
+            "search_type": search_type,
+            "prompt_mode": "custom",
+            "step": step
+        }
+        prompt_msg = "✏️ Enter target username for SIEM analysis:" if search_type == "user" else "💻 Enter target hostname for SIEM analysis (agent.name):"
+        bot.send_text(chat_id, prompt_msg)
 
     elif callback_data.startswith("period:"):
         period_key = callback_data.split(":")[1]
@@ -505,8 +576,13 @@ def on_callback(bot: VKTeamsBot, payload: dict):
             bot.send_text(chat_id, "⚠️ Session expired.", kb_main())
             return
 
-        USER_STATES[user_id]["step"] = "sending_ai"
-        EXECUTOR.submit(async_send_to_ai, bot, chat_id, user_id)
+        prompt_mode = state.get("prompt_mode", "default")
+        if prompt_mode == "custom":
+            USER_STATES[user_id]["step"] = "awaiting_custom_prompt"
+            bot.send_text(chat_id, "✍️ Enter your custom prompt for AI analysis:")
+        else:
+            USER_STATES[user_id]["step"] = "sending_ai"
+            EXECUTOR.submit(async_send_to_ai, bot, chat_id, user_id)
 
 
 # =============================================================================
@@ -516,6 +592,7 @@ def main():
     bot = VKTeamsBot(VK_TEAMS_TOKEN, VK_TEAMS_API_URL)
     print("🤖 SIEM Bot started successfully.")
 
+    # Drain accumulated historical events on startup to prevent processing stale requests
     try:
         initial_resp = bot.get_events(poll_time=1)
         if initial_resp and initial_resp.get("events"):
