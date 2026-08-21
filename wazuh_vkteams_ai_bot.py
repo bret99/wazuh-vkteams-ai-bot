@@ -256,7 +256,7 @@ def fetch_wazuh_events(target_val: str, search_type: str, start_iso: str, end_is
 def process_report_jq(raw_path: str, final_path: str) -> bool:
     """Strip unnecessary fields from raw report using jq utility."""
     jq_cmd = (
-        f"jq 'map(del(.agent.ip, .agent.id, .agent.name, .timestamp, .siem_node, "
+        f"jq 'map(del(.agent, .timestamp, .siem_node, "
         f".decoder, .input, .manager, .full_log, .full.log, .location, .id, "
         f".rule.level, .rule.id, .rule.mail, .rule.groups, .rule.pci_dss, "
         f".rule.hipaa, .rule.tsc, .rule.gdpr, .rule.gpdr, "
