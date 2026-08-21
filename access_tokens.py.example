@@ -16,7 +16,7 @@ WAZUH_PASS = "" # substitute for actual one
 # AI API Settings
 AI_KEY = "" # substitute for actual one
 AI_URL = "https://example-ai.com/api/v1/chat/completions" # substitute for actual one
-AI_MODEL = "qwen/qwen3.7-plus" # substitute for actual one; 1 million tokens supprt prefered
+AI_MODEL = "qwen/qwen3.7-plus" # substitute for actual one; 1 million tokens LLM support prefered
 
 # Target user fields across SIEM events; substitute for actual ones (see at https://github.com/bret99/wazuh_custom_rules)
 TARGET_USER_FIELDS = [
