@@ -12,11 +12,21 @@ import subprocess
 import sys
 import time
 import urllib3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from opensearchpy import OpenSearch
+
+# Tokenization setup with fallback
+try:
+    import tiktoken
+    TOKENIZER = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    TOKENIZER = None
+
+TOKEN_THRESHOLD = 1_000_000
+CHUNK_MAX_TOKENS = 800_000
 
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -24,15 +34,30 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-from access_tokens import VK_TEAMS_TOKEN, VK_TEAMS_API_URL, AI_KEY, AI_URL, AI_MODEL, TARGET_USER_FIELDS, EXCLUDED_RULE_GROUPS, WAZUH_HOST, WAZUH_USER, WAZUH_PASS
+from access_tokens import (
+    VK_TEAMS_TOKEN,
+    VK_TEAMS_API_URL,
+    AI_KEY,
+    AI_URL,
+    AI_MODEL,
+    TARGET_USER_FIELDS,
+    EXCLUDED_RULE_GROUPS,
+    WAZUH_HOST,
+    WAZUH_USER,
+    WAZUH_PASS
+)
 
 ALLOWED_USERS = []
 
 PERIOD_DELTAS = {
     "1h": (timedelta(hours=1), "1 hour"),
+    "3h": (timedelta(hours=3), "3 hours"),
+    "6h": (timedelta(hours=6), "6 hours"),
     "12h": (timedelta(hours=12), "12 hours"),
     "24h": (timedelta(hours=24), "24 hours"),
+    "3d": (timedelta(days=3), "3 days"),
     "7d": (timedelta(days=7), "7 days"),
+    "14d": (timedelta(days=14), "14 days"),
     "30d": (timedelta(days=30), "30 days")
 }
 
@@ -88,6 +113,70 @@ DEFAULT_HOST_PROMPT_TEMPLATE = (
 # Global FSM storage and worker pool
 USER_STATES = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=6)
+
+
+# =============================================================================
+# HELPER FUNCTIONS & TOKENIZATION
+# =============================================================================
+def count_tokens(text: str) -> int:
+    """Calculate token count using tiktoken (cl100k_base) or fallback estimation."""
+    if TOKENIZER:
+        try:
+            return len(TOKENIZER.encode(text))
+        except Exception:
+            pass
+    return len(text) // 4
+
+
+def split_events_into_chunks(events: list, max_chunk_tokens: int = CHUNK_MAX_TOKENS) -> list:
+    """Split event array into chunks bounded by max token capacity."""
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for event in events:
+        event_str = json.dumps(event, ensure_ascii=False)
+        event_tokens = count_tokens(event_str)
+
+        if current_tokens + event_tokens > max_chunk_tokens and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = [event]
+            current_tokens = event_tokens
+        else:
+            current_chunk.append(event)
+            current_tokens += event_tokens
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def send_raw_prompt_to_router_ai(prompt: str) -> str:
+    """Send isolated payload to RouterAI API with type-safe response handling."""
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1000
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AI_KEY}"
+    }
+
+    try:
+        response = requests.post(AI_URL, headers=headers, json=payload, timeout=120)
+        if response.status_code == 200:
+            result = response.json()
+            choices = result.get("choices")
+            if choices and isinstance(choices, list) and len(choices) > 0:
+                message = choices[0].get("message", {})
+                if isinstance(message, dict):
+                    return message.get("content", "❌ Empty content returned by AI.")
+            return "❌ Malformed response structure from RouterAI API."
+        return f"❌ RouterAI API Error [{response.status_code}]: {response.text}"
+    except Exception as e:
+        return f"❌ Failed to reach RouterAI API: {e}"
 
 
 # =============================================================================
@@ -167,8 +256,11 @@ def fetch_wazuh_events(target_val: str, search_type: str, start_iso: str, end_is
 def process_report_jq(raw_path: str, final_path: str) -> bool:
     """Strip unnecessary fields from raw report using jq utility."""
     jq_cmd = (
-        f"jq 'map(del(.agent.ip, .agent.id, .decoder, .input, .manager, "
-        f".full_log, .full.log, .location, .id, .rule.level, .rule.id, .rule.mail))' "
+        f"jq 'map(del(.agent.ip, .agent.id, .agent.name, .timestamp, .siem_node, "
+        f".decoder, .input, .manager, .full_log, .full.log, .location, .id, "
+        f".rule.level, .rule.id, .rule.mail, .rule.groups, .rule.pci_dss, "
+        f".rule.hipaa, .rule.tsc, .rule.gdpr, .rule.gpdr, "
+        f".win.eventdata.binary, .data.win.eventdata.binary))' "
         f"{shlex.quote(raw_path)} > {shlex.quote(final_path)}"
     )
     res = subprocess.run(jq_cmd, shell=True, capture_output=True, text=True)
@@ -176,37 +268,58 @@ def process_report_jq(raw_path: str, final_path: str) -> bool:
 
 
 def query_router_ai(json_data: list, target_val: str, search_type: str, period_label: str, custom_prompt: str = None) -> str:
-    """Send aggregated report to RouterAI API using default or custom prompt."""
-    if custom_prompt:
-        prompt = f"{custom_prompt}\n\nJSON данных:\n" + json.dumps(json_data, ensure_ascii=False)
-    else:
-        template = DEFAULT_USER_PROMPT_TEMPLATE if search_type == "user" else DEFAULT_HOST_PROMPT_TEMPLATE
-        prompt = template.format(
-            target_val=target_val,
-            events_count=len(json_data),
-            date_str=datetime.now().strftime("%Y-%m-%d"),
-            period_label=period_label
-        ) + "\n\nJSON данных:\n" + json.dumps(json_data, ensure_ascii=False)
+    """Send report to RouterAI using single-pass or chunked evaluation with synthesis based on token count."""
+    json_str = json.dumps(json_data, ensure_ascii=False)
+    total_tokens = count_tokens(json_str)
 
-    payload = {
-        "model": AI_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1000
-    }
+    if total_tokens < TOKEN_THRESHOLD:
+        if custom_prompt:
+            prompt = f"{custom_prompt}\n\nJSON data:\n{json_str}"
+        else:
+            template = DEFAULT_USER_PROMPT_TEMPLATE if search_type == "user" else DEFAULT_HOST_PROMPT_TEMPLATE
+            prompt = template.format(
+                target_val=target_val,
+                events_count=len(json_data),
+                date_str=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                period_label=period_label
+            ) + f"\n\nJSON data:\n{json_str}"
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AI_KEY}"
-    }
+        return send_raw_prompt_to_router_ai(prompt)
 
-    try:
-        response = requests.post(AI_URL, headers=headers, json=payload, timeout=120)
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        return f"❌ RouterAI API Error [{response.status_code}]: {response.text}"
-    except Exception as e:
-        return f"❌ Failed to reach RouterAI API: {e}"
+    # Multi-chunk processing for large datasets
+    chunks = split_events_into_chunks(json_data, CHUNK_MAX_TOKENS)
+    total_chunks = len(chunks)
+    partial_reports = []
+
+    for idx, chunk in enumerate(chunks, 1):
+        chunk_json_str = json.dumps(chunk, ensure_ascii=False)
+        if custom_prompt:
+            chunk_prompt = (
+                f"Это часть {idx} из {total_chunks} общего отчета событий безопасности.\n"
+                f"{custom_prompt}\n\nJSON данные части {idx}:\n{chunk_json_str}"
+            )
+        else:
+            template = DEFAULT_USER_PROMPT_TEMPLATE if search_type == "user" else DEFAULT_HOST_PROMPT_TEMPLATE
+            chunk_prompt = template.format(
+                target_val=f"{target_val} (Часть {idx}/{total_chunks})",
+                events_count=len(chunk),
+                date_str=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                period_label=period_label
+            ) + f"\n\nJSON данные части {idx}:\n{chunk_json_str}"
+
+        partial_res = send_raw_prompt_to_router_ai(chunk_prompt)
+        partial_reports.append(f"--- Результат анализа части {idx}/{total_chunks} ---\n{partial_res}")
+
+    combined_partials = "\n\n".join(partial_reports)
+    synthesis_prompt = (
+        f"Ниже приведены результаты независимого анализа {total_chunks} частей одного отчета безопасности для {search_type} '{target_val}'.\n"
+        f"Временной диапазон: {period_label}.\n\n"
+        f"Сформируй ИТОГОВЫЙ ЕДИНЫЙ SOC-ОТЧЕТ, объединив все ключевые находки, дубликаты и выводы из всех частей.\n"
+        f"Придерживайся стандартной структуры отчета SOC (Краткое резюме, Детальный разбор ключевых событий, Рекомендации, Статус отчета).\n\n"
+        f"ЧАСТНЫЕ ОЦЕНКИ ВСЕХ ЧАСТЕЙ:\n{combined_partials}"
+    )
+
+    return send_raw_prompt_to_router_ai(synthesis_prompt)
 
 
 def cleanup_all_reports(target_val: str = None, search_type: str = "user"):
@@ -312,14 +425,20 @@ def kb_prompt_options(search_type: str):
 def kb_periods():
     return [
         [
-            {"text": "⏱️ 1 hour", "callbackData": "period:1h", "style": "primary"},
-            {"text": "⏱️ 12 hours", "callbackData": "period:12h", "style": "primary"}
+            {"text": "⏱️ 1h", "callbackData": "period:1h", "style": "primary"},
+            {"text": "⏱️ 3h", "callbackData": "period:3h", "style": "primary"},
+            {"text": "⏱️ 6h", "callbackData": "period:6h", "style": "primary"}
         ],
         [
-            {"text": "⏱️ 24 hours", "callbackData": "period:24h", "style": "primary"},
-            {"text": "⏱️ 7 days", "callbackData": "period:7d", "style": "primary"}
+            {"text": "⏱️ 12h", "callbackData": "period:12h", "style": "primary"},
+            {"text": "⏱️ 24h", "callbackData": "period:24h", "style": "primary"},
+            {"text": "⏱️ 3d", "callbackData": "period:3d", "style": "primary"}
         ],
-        [{"text": "⏱️ 30 days", "callbackData": "period:30d", "style": "primary"}],
+        [
+            {"text": "⏱️ 7d", "callbackData": "period:7d", "style": "primary"},
+            {"text": "⏱️ 14d", "callbackData": "period:14d", "style": "primary"},
+            {"text": "⏱️ 30d", "callbackData": "period:30d", "style": "primary"}
+        ],
         [{"text": "❌ Cancel", "callbackData": "menu:main", "style": "attention"}]
     ]
 
@@ -344,7 +463,7 @@ def _check_access(user_id: str, chat_id: str, bot: VKTeamsBot) -> bool:
 
 
 def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, period_key: str):
-    """Collect events from Wazuh node, apply jq filter, and present decision menu."""
+    """Collect events from Wazuh node, apply jq filter, calculate tokens, and present decision menu."""
     state = USER_STATES.get(user_id, {})
     target_val = state.get("target_val")
     search_type = state.get("search_type", "user")
@@ -353,7 +472,7 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
     entity_label = "user" if search_type == "user" else "host"
     bot.send_text(chat_id, f"⏳ Collecting events for {entity_label} `{target_val}` from Wazuh ({period_label})...")
 
-    end_date = datetime.now()
+    end_date = datetime.now(timezone.utc)
     start_date = end_date - delta
     start_iso = start_date.isoformat()
     end_iso = end_date.isoformat()
@@ -385,12 +504,19 @@ def async_collect_and_process(bot: VKTeamsBot, chat_id: str, user_id: str, perio
         size_bytes = os.path.getsize(final_file)
         size_kb = size_bytes / 1024.0
 
+        with open(final_file, "r", encoding="utf-8") as f:
+            processed_data = json.load(f)
+
+        tokens_count = count_tokens(json.dumps(processed_data, ensure_ascii=False))
+
         USER_STATES[user_id]["step"] = "awaiting_ai_decision"
         USER_STATES[user_id]["period_label"] = period_label
 
         bot.send_text(
             chat_id,
-            f"✅ Report generated from SIEM node.\n📁 File size: `{size_kb:.2f} KB` (`{size_bytes}` bytes)\n\n"
+            f"✅ Report generated from SIEM node.\n"
+            f"📁 File size: `{size_kb:.2f} KB` (`{size_bytes}` bytes)\n"
+            f"🧮 Tokens: `{tokens_count:,}`\n\n"
             f"Do you want to send this report to AI for analysis?",
             kb_ai_decision()
         )
